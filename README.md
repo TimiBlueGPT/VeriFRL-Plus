@@ -34,7 +34,7 @@ Core changes use the existing source files. Training has no dependency on experi
 
 ## Data
 
-The data preparation source follows [FedDCSR](https://github.com/orion-orion/FedDCSR). Each domain needs only:
+Data preparation follows [VeriFRL](https://github.com/TimiBlueGPT/VeriFRL). Each domain needs only:
 
 ```text
 data/Food/

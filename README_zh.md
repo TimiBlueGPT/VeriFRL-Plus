@@ -34,7 +34,7 @@ pip install -r requirements.txt
 
 ## 数据准备
 
-沿用 [FedDCSR](https://github.com/orion-orion/FedDCSR) 的数据准备来源。每个域只需：
+数据准备沿用 [VeriFRL](https://github.com/TimiBlueGPT/VeriFRL) 的设置。每个域只需：
 
 ```text
 data/Food/
