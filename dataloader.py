@@ -2,6 +2,7 @@
 import random
 import numpy as np
 from torch.utils.data import DataLoader
+from utils.train_utils import preserve_random_state, stream_seed
 
 
 class SeqDataloader(DataLoader):
@@ -10,10 +11,12 @@ class SeqDataloader(DataLoader):
         self.num_items = dataset.num_items
         self.mode = dataset.mode
         self.batch_size = batch_size
-        self.shuffle = True
+        self.shuffle = shuffle
 
         if shuffle == True:
-            random.shuffle(self.dataset)
+            with preserve_random_state(stream_seed(dataset.seed, dataset.domain,
+                    'loader', dataset.method), python_only=True):
+                random.shuffle(self.dataset)
 
         if len(dataset) % batch_size == 0:
             self.num_batch = len(dataset) // batch_size

@@ -33,13 +33,12 @@ def save_config(args, verbose=True):
                                     "domain_" +
                                     "".join([domain[0]
                                             for domain in args.domains]),
-                                    args.method + "_" + model_id)
+                                    args.method + "_" + args.aggregation + "_" + model_id)
     ensure_dir(method_ckpt_path, verbose=True)
 
     config_filename = os.path.join(method_ckpt_path, "config.json")
     args_dict = vars(args)
-    with open(config_filename, "w") as outfile:
-        json.dump(vars(args), outfile, indent=2)
+    atomic_write(config_filename, vars(args))
     if verbose:
         print("Config saved to file {}.".format(config_filename))
 
@@ -51,3 +50,33 @@ def print_config(config):
     for k, v in config.items():
         info += "\t{} : {}\n".format(k, str(v))
     logging.info(info)
+
+
+def atomic_write(path, value, tensor=False):
+    """Replace a complete file only after the new contents reach disk."""
+    from pathlib import Path
+    import tempfile
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb" if tensor else "w", **({} if tensor else {"encoding": "utf-8"})) as stream:
+            if tensor:
+                import torch
+                torch.save(value, stream)
+            else:
+                json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
+                stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def data_fingerprints(args):
+    import hashlib
+    from pathlib import Path
+    return {f'{domain}/{name}':hashlib.sha256((Path(args.data_dir)/domain/name).read_bytes()).hexdigest()
+        for domain in args.domains for name in ('num_items.txt','train_data.txt','valid_data.txt','test_data.txt')}

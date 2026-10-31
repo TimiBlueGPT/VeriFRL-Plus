@@ -138,15 +138,12 @@ class DisenVGSAN(nn.Module):
         mu_e, logvar_e = self.encoder_e(seqs_emb_e, seqs)
         z_e = self.reparameterization(mu_e, logvar_e)
 
-        if not self.training:
-            result = self.linear(z_s + z_e)
-            result_pad = self.linear_pad(z_s + z_e)
-        else:
-            result = self.linear(z_s + z_e)
-            result_pad = self.linear_pad(z_s + z_e)
-        result_exclusive = self.linear(z_e)
-        result_exclusive_pad = self.linear_pad(z_e)
+        result = self.linear(z_s + z_e)
+        result_pad = self.linear_pad(z_s + z_e)
         if self.training:
+            # The exclusive prediction is a training-only auxiliary objective.
+            result_exclusive = self.linear(z_e)
+            result_exclusive_pad = self.linear_pad(z_e)
             return torch.cat((result, result_pad), dim=-1), \
                 torch.cat((result_exclusive, result_exclusive_pad), dim=-1), \
                 mu_s, logvar_s, z_s, mu_e, logvar_e, z_e, neg_z_e, aug_z_e

@@ -72,13 +72,12 @@ class SelfAttention(nn.Module):
             self.forward_layers.append(new_fwd_layer)
 
     def forward(self, seqs, seqs_data):
-        timeline_mask = torch.BoolTensor(
-            seqs_data.cpu() == self.num_items).to(self.device)
+        timeline_mask = seqs_data.eq(self.num_items)
         seqs = seqs * ~timeline_mask.unsqueeze(-1)
 
         tl = seqs.shape[1]
         attention_mask = ~torch.tril(torch.ones(
-            (tl, tl), dtype=torch.bool)).to(self.device)
+            (tl, tl), dtype=torch.bool, device=seqs.device))
 
         for i in range(len(self.attention_layers)):
             seqs = torch.transpose(seqs, 0, 1)

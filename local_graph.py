@@ -31,7 +31,7 @@ class LocalGraph(object):
 
     def __init__(self, args, domain, num_items):
         self.args = args
-        self.dataset_dir = os.path.join(self.data_dir, domain)
+        self.dataset_dir = os.path.join(getattr(args, "data_dir", self.data_dir), domain)
         self.raw_data = self.read_train_data(self.dataset_dir)
         self.num_items = num_items
         self.adj = self.preprocess(self.raw_data)

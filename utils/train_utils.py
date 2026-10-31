@@ -197,3 +197,48 @@ class LRDecay:
             else:
                 self.counter = 0
         self.latest_score = score
+
+
+def stable_digest(value):
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+
+
+def stream_seed(seed, domain, purpose, method=None):
+    """Stable, separate streams for initialization, training, scoring and reading."""
+    return int(stable_digest([seed, domain, purpose, method])[:16], 16)
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def preserve_random_state(seed=None, python_only=False):
+    """Analysis may use randomness without advancing the training streams."""
+    import random
+    import numpy as np
+    python_state = random.getstate()
+    if python_only:
+        try:
+            if seed is not None:
+                random.seed(seed)
+            yield
+        finally:
+            random.setstate(python_state)
+        return
+    numpy_state = np.random.get_state()
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_initialized() else []
+    try:
+        with torch.random.fork_rng(devices=devices):
+            if seed is not None:
+                random.seed(seed)
+                np.random.seed(seed % 2**32)
+                torch.random.default_generator.manual_seed(seed)
+                for device in devices:
+                    torch.cuda.default_generators[device].manual_seed(seed)
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)

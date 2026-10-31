@@ -1,73 +1,28 @@
 # -*- coding: utf-8 -*-
-import numpy as np
 import torch
 from dataset import SeqDataset
 from local_graph import LocalGraph
 
 
 def load_dataset(args):
-    client_train_datasets = []
-    client_valid_datasets = []
-    client_test_datasets = []
-    client_tracin_datasets=[]
+    datasets = {mode: [] for mode in ('train', 'valid', 'test', 'tracin')}
+    graphs = []
     for domain in args.domains:
-        if args.method == "VeriFRL_Fed":
-            model = "DisenVGSAN"
-        else:
-            model = args.method.replace("Fed", "")
-            model = model.replace("Local", "")
-
-        train_dataset = SeqDataset(
-            domain, model, mode="train", max_seq_len=args.max_seq_len,
-            load_prep=args.load_prep)
-        valid_dataset = SeqDataset(
-            domain, model, mode="valid", max_seq_len=args.max_seq_len,
-            load_prep=args.load_prep)
-        test_dataset = SeqDataset(
-            domain, model, mode="test", max_seq_len=args.max_seq_len,
-            load_prep=args.load_prep)
-        tracin_dataset = SeqDataset(
-            domain, model, mode="tracin", max_seq_len=args.max_seq_len,
-            load_prep=args.load_prep
-        )
-
-        client_train_datasets.append(train_dataset)
-        client_valid_datasets.append(valid_dataset)
-        client_test_datasets.append(test_dataset)
-        client_tracin_datasets.append(tracin_dataset)
-
-    adjs = []
-    adjs_tracin = []
-    for train_dataset, domain in zip(client_train_datasets, args.domains):
-        local_graph = LocalGraph(args, domain, train_dataset.num_items)
-        adjs.append(local_graph.adj)
-        print("%s graph loaded!" % domain)
-
-    for tracin_dataset, domain in zip(client_tracin_datasets, args.domains):
-        local_graph = LocalGraph(args, domain, tracin_dataset.num_items)
-        adjs_tracin.append(local_graph.adj)
-        print("%s graph loaded!" % domain)
-
-    if args.cuda:
-        torch.cuda.empty_cache()
-        device = "cuda:%s" % args.gpu
-    else:
-        device = "cpu"
-    for idx, adj in enumerate(adjs):
-        adjs[idx] = adj.to(device)
-
-    for idx, adj in enumerate(adjs):
-        adjs_tracin[idx] = adj.to(device)
-
-    return client_train_datasets, client_valid_datasets, \
-        client_test_datasets,client_tracin_datasets, adjs , adjs_tracin
+        model = 'DisenVGSAN' if args.method == 'VeriFRL_Fed' else args.method.replace('Local','').replace('Fed','')
+        current = {mode: SeqDataset(domain, model, mode, args.max_seq_len,
+                    load_prep=False, args=args) for mode in ('train','valid','test')}
+        current['tracin'] = (SeqDataset(domain, model, 'tracin', args.max_seq_len, args=args)
+            if args.method == 'VeriFRL_Fed' and not args.disable_online_scoring else current['valid'])
+        for mode in datasets:
+            datasets[mode].append(current[mode])
+        graph = LocalGraph(args, domain, current['train'].num_items)
+        graphs.append(graph.adj.to('cuda:' + args.gpu if args.cuda else 'cpu'))
+    # Scoring uses the actual training graph, including the fixed TRAIN reference rows.
+    return *(datasets[mode] for mode in ('train','valid','test','tracin')), graphs, list(graphs)
 
 
 def init_clients_weight(clients):
-    client_n_samples_train = [client.n_samples_train for client in clients]
-
-    samples_sum_train = np.sum(client_n_samples_train)
+    total = sum(client.n_samples_train for client in clients)
     for client in clients:
-        client.train_weight = client.n_samples_train / samples_sum_train
-        client.valid_weight = 1 / len(clients)
-        client.test_weight = 1 / len(clients)
+        client.train_weight = client.n_samples_train / total
+        client.valid_weight = client.test_weight = 1 / len(clients)

@@ -7,6 +7,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+from utils.io_utils import atomic_write
 
 
 def _is_shared_param(name):
@@ -244,6 +245,10 @@ def _branch_inner_product(grad_list_a, grad_list_b, indices):
     return total
 
 
+from utils.train_utils import preserve_random_state
+
+
+@preserve_random_state()
 def compute_influence_for_clients(clients, args):
     if not clients:
         logging.info("No clients provided for influence computation.")
@@ -253,6 +258,7 @@ def compute_influence_for_clients(clients, args):
     influence_results = defaultdict(dict)
 
     tail_ratio = getattr(args, "influence_branch_tail_ratio", 1.0)
+    output_path = os.path.join(clients[0].get_method_checkpoint_path(), "influence_scores.json")
 
     for client in clients:
         base_dir = client.get_method_checkpoint_path()
@@ -317,6 +323,7 @@ def compute_influence_for_clients(clients, args):
                 branch_scores[branch_name] = float((-branch_dot).item())
 
             influence_results[round_dir]["client_%d" % client.c_id] = branch_scores
+            atomic_write(output_path, influence_results)
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -328,8 +335,7 @@ def compute_influence_for_clients(clients, args):
     output_dir = clients[0].get_method_checkpoint_path()
     output_path = os.path.join(output_dir, "influence_scores.json")
     try:
-        with open(output_path, "w", encoding="utf-8") as outfile:
-            json.dump(influence_results, outfile, indent=2)
+        atomic_write(output_path, influence_results)
         logging.info("Influence scores saved to %s", output_path)
     except IOError:
         logging.warning("Failed to save influence scores to %s", output_path)

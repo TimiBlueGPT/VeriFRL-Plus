@@ -378,17 +378,19 @@ class ModelTrainer(Trainer):
         s2 = self.flatten(params2_values)
         return mu/2 * torch.norm(s1 - s2)
 
-    def test_batch(self, sessions):
-        sessions = [torch.LongTensor(x).to(self.device) for x in sessions]
+    @torch.no_grad()
+    def test_batch(self, sessions, return_losses=False):
+        sessions = [torch.as_tensor(x, dtype=torch.long, device=self.device) for x in sessions]
         seq, ground_truth, neg_list = sessions
         result = self.model(seq)
 
-        pred = []
-        for id in range(len(result)):
-            score = result[id, -1]
-            cur = score[ground_truth[id]]
-            score_larger = (score[neg_list[id]] > (cur)).data.cpu().numpy()
-            true_item_rank = np.sum(score_larger) + 1
-            pred.append(true_item_rank)
-
-        return pred
+        # Preserve strict '>' tie handling and repeated negative candidates,
+        # with a single device-to-host transfer for the whole batch.
+        score = result[:, -1, :]
+        positive = score.gather(1, ground_truth.unsqueeze(1))
+        negatives = score.gather(1, neg_list)
+        ranks = (negatives > positive).sum(dim=1) + 1
+        if return_losses:
+            losses = torch.nn.functional.cross_entropy(score, ground_truth, reduction='none')
+            return ranks.cpu().tolist(), losses.cpu().tolist()
+        return ranks.cpu().tolist()

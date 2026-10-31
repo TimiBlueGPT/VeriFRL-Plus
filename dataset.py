@@ -7,6 +7,7 @@ import pickle
 import numpy as np
 from collections import defaultdict
 from torch.utils.data import Dataset
+from utils.train_utils import preserve_random_state, stream_seed, stable_digest
 
 
 class SeqDataset(Dataset):
@@ -15,17 +16,24 @@ class SeqDataset(Dataset):
     num_test_neg = 999
 
     def __init__(self, domain, model="SAN", mode="train", max_seq_len=16,
-                 load_prep=True):
+                 load_prep=False, args=None):
         assert (model in ["DisenVGSAN", "VGSAN", "SASRec",
                 "VSAN", "ContrastVAE", "CL4SRec", "DuoRec"])
         assert (mode in ["train", "valid", "test","tracin"])
 
+        self.args = args
+        self.seed = getattr(args, 'seed', 42)
+        self.eval_seed = getattr(args, 'eval_seed', 20261021)
+        self.method = getattr(args, 'method', 'VeriFRL_Fed')
+        self.data_dir = getattr(args, 'data_dir', self.data_dir)
+        self.num_test_neg = getattr(args, 'num_test_neg', 999)
         self.domain = domain
         self.model = model
         self.mode = mode
         self.dataset_dir = os.path.join(self.data_dir, self.domain)
         self.user_ids, self.sessions, self.num_items \
             = self.read_data(self.dataset_dir)
+        self.raw_sample_count = len(self.sessions)
         self.max_seq_len = max_seq_len
         self.prep_sessions = self.preprocess(
             self.sessions, self.dataset_dir, load_prep)
@@ -36,7 +44,7 @@ class SeqDataset(Dataset):
             num_items = int(infile.readline())
 
         with open(os.path.join(self.data_dir, self.domain,
-                               "%s_data.txt" % self.mode), "rt",
+                               "%s_data.txt" % ("train" if self.mode == "tracin" else self.mode)), "rt",
                   encoding="utf-8") as infile:
             user_ids, sessions = [], []
             for line in infile.readlines():
@@ -49,6 +57,17 @@ class SeqDataset(Dataset):
                 sessions.append(session)
         print("Successfully load %s %s data!" % (self.domain, self.mode))
 
+        self.probe_indices = None
+        if self.mode == 'tracin':
+            indices = list(range(len(sessions)))
+            seed = int(stable_digest({'seed': getattr(self.args, 'probe_seed', 42),
+                'domain': self.domain, 'purpose': 'fixed_train_probe'}), 16)
+            random.Random(seed).shuffle(indices)
+            self.probe_indices = sorted(indices[:getattr(self.args, 'probe_size', 256)])
+            user_ids = [user_ids[i] for i in self.probe_indices]
+            sessions = [sessions[i] for i in self.probe_indices]
+        if not sessions:
+            raise ValueError(f'Empty {self.domain}/{self.mode} data')
         return user_ids, sessions, num_items
 
     def preprocess(self, sessions, dataset_dir, load_prep):
@@ -59,25 +78,34 @@ class SeqDataset(Dataset):
                           "ContrastVAE": self.preprocess_contrastvae,
                           "CL4SRec": self.preprocess_cl4srec,
                           "DuoRec": self.preprocess_duorec}
-        if not os.path.exists(os.path.join(dataset_dir, self.prep_dir)):
-            os.makedirs(os.path.join(dataset_dir, self.prep_dir))
-
-        self.prep_data_path = os.path.join(
-            dataset_dir, self.prep_dir, "%s_%s_data.pkl" % (self.model,
-                                                            self.mode))
-        if os.path.exists(self.prep_data_path) and load_prep:
-            with open(os.path.join(self.prep_data_path), "rb") as infile:
-                prep_sessions = pickle.load(infile)
-            print("Successfully load preprocessed %s %s data!" %
-                  (self.domain, self.mode))
-        else:
-            prep_sessions = prep_functions[self.model](
-                sessions, mode=self.mode)
-            with open(self.prep_data_path, "wb") as infile:
-                pickle.dump(prep_sessions, infile)
-            print("Successfully preprocess %s %s data!" %
-                  (self.domain, self.mode))
-        return prep_sessions
+        # Prepare deterministic samples in memory: no stale, seed-agnostic caches.
+        if self.mode in ('valid', 'test'):
+            import hashlib
+            seed = int(stable_digest({'eval_seed': self.eval_seed, 'domain': self.domain,
+                                     'split': self.mode})[:16], 16)
+            rng = np.random.default_rng(seed)
+            metadata = {'schema_version': 1, 'domain': self.domain, 'split': self.mode,
+                'eval_seed': self.eval_seed, 'num_negatives': self.num_test_neg,
+                'num_items': self.num_items, 'max_seq_len': self.max_seq_len,
+                'sampling': 'uniform_with_replacement_excluding_only_target'}
+            fingerprint = hashlib.sha256(stable_digest(metadata).encode('ascii'))
+            prepared = []
+            for uid, session in zip(self.user_ids, sessions):
+                if len(session) < 2 or len(session)-1 > self.max_seq_len:
+                    raise ValueError('Invalid evaluation sequence length')
+                target = session[-1]
+                draws = rng.integers(0, self.num_items-1, size=self.num_test_neg, dtype=np.int64)
+                draws += draws >= target
+                padded = [self.num_items]*(self.max_seq_len-len(session)+1) + session[:-1]
+                fingerprint.update(np.asarray([uid,len(session),*session], dtype='<i8').tobytes())
+                fingerprint.update(draws.astype('<i8', copy=False).tobytes())
+                prepared.append([padded, target, draws.astype(np.int32 if self.num_items < 2**31 else np.int64)])
+            self.candidate_sha256 = fingerprint.hexdigest()
+            return prepared
+        purpose = 'audit_preprocess' if self.mode == 'tracin' else 'training_preprocess'
+        seed = self.eval_seed if self.mode == 'tracin' else self.seed
+        with preserve_random_state(stream_seed(seed, self.domain, purpose, self.method)):
+            return prep_functions[self.model](sessions, mode=self.mode)
 
     @ staticmethod
     def random_neg(left, right, excl):

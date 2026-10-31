@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import math
 import gc
 import copy
 import logging
@@ -7,6 +8,8 @@ import numpy as np
 import torch
 from dataloader import SeqDataloader
 from utils.io_utils import ensure_dir
+from utils.train_utils import preserve_random_state, stream_seed
+from utils.io_utils import atomic_write
 
 
 class Client:
@@ -22,7 +25,7 @@ class Client:
         self._method_ckpt_path = os.path.join(
             self.checkpoint_dir,
             "domain_" + "".join([domain[0] for domain in args.domains]),
-            self.method + "_" + self.model_id)
+            self.method + "_" + args.aggregation + "_" + self.model_id)
         ensure_dir(self._method_ckpt_path, verbose=True)
         if args.method == "VeriFRL_Fed":
             self.z_s = self.trainer.z_s
@@ -42,7 +45,8 @@ class Client:
             tracin_dataset, batch_size=args.batch_size, shuffle=False
         )
 
-        self.n_samples_train = len(train_dataset)
+        self.n_samples_train = train_dataset.raw_sample_count
+        self.online_audit_enabled = self.method == "VeriFRL_Fed" and not args.disable_online_scoring
         self.n_samples_valid = len(valid_dataset)
         self.n_samples_test = len(test_dataset)
         self.train_pop, self.valid_weight, self.test_weight = 0.0, 0.0, 0.0
@@ -54,8 +58,10 @@ class Client:
         self._cached_eval_batch = None
 
     def train_epoch(self, round, args, global_params=None):
+        self.audit_round = round
         self.trainer.model.train()
-        self._pre_train_state = copy.deepcopy(self.trainer.model.state_dict())
+        audit_enabled = getattr(self, 'online_audit_enabled', True)
+        self._pre_train_state = copy.deepcopy(self.trainer.model.state_dict()) if audit_enabled else None
         for _ in range(args.local_epoch):
             loss = 0
             step = 0
@@ -71,12 +77,18 @@ class Client:
                 step += 1
 
             gc.collect()
-        delta_vector = self._gather_shared_param_deltas_vector()
-        post_train_state = copy.deepcopy(self.trainer.model.state_dict())
-        self.latest_eval_score = self._compute_eval_tracin_score(
-            delta_vector, post_train_state)
+        self.latest_eval_score = None
+        if audit_enabled:
+            delta_vector = self._gather_shared_param_deltas_vector()
+            post_train_state = copy.deepcopy(self.trainer.model.state_dict())
+            self.latest_eval_score = self._compute_eval_tracin_score(
+                delta_vector, post_train_state)
+        # The score has restored the trained parameters; this GPU snapshot is
+        # no longer needed between clients/rounds.
+        self._pre_train_state = None
         logging.info("Epoch {}/{} - client {} -  Training Loss: {:.3f}".format(
             round, args.epochs, self.c_id, loss / step))
+        self.latest_train_loss = loss / step
         return self.n_samples_train
 
     def _get_shared_modules(self):
@@ -147,6 +159,40 @@ class Client:
         return self._cached_eval_batch
 
     def _compute_eval_tracin_score(self, delta_vector, post_train_state):
+        # Scoring is observational: preserve training streams and transient state
+        # even when the score callback raises. External paired-audit wrappers may
+        # additionally seed their own reproducible analysis streams.
+        model, trainer = self.trainer.model, self.trainer
+        modes = [(module, module.training) for module in model.modules()]
+        parameters = list(trainer.params)
+        gradients = [p.grad for p in parameters]
+        caches = {name: (hasattr(model, name), getattr(model, name, None)) for name in
+                  ('item_index_s', 'item_index_e', 'item_graph_embs_s', 'item_graph_embs_e')}
+        representations = [(value, value[0]) for name in ('z_s', 'z_g')
+                           if (value := getattr(self, name, None)) is not None]
+        step = trainer.step
+        for p in parameters:
+            p.grad = None
+        try:
+            with preserve_random_state(stream_seed(self.args.eval_seed, self.domain,
+                    'audit_score', self.audit_round)):
+                return self._compute_eval_tracin_score_impl(delta_vector, post_train_state)
+        finally:
+            model.load_state_dict(post_train_state)
+            trainer.step = step
+            for module, mode in modes:
+                module.training = mode
+            for container, value in representations:
+                container[0] = value
+            for name, (present, value) in caches.items():
+                if present:
+                    setattr(model, name, value)
+                elif hasattr(model, name):
+                    delattr(model, name)
+            for parameter, gradient in zip(parameters, gradients):
+                parameter.grad = gradient
+
+    def _compute_eval_tracin_score_impl(self, delta_vector, post_train_state):
         if delta_vector is None or self._pre_train_state is None:
             return None
         if delta_vector.numel() == 0:
@@ -186,26 +232,49 @@ class Client:
 
         return torch.dot(g_c_vector, grad_vector).item()
 
-    def evaluation(self, mode="valid"):
-        if mode == "valid":
-            dataloader = self.valid_dataloader
-        elif mode == "test":
-            dataloader = self.test_dataloader
-
-        self.trainer.model.eval()
-        if (self.method == "VeriFRL_Fed") or ("VGSAN" in self.method):
-            self.trainer.model.graph_convolution(self.adj)
-        pred = []
-        for _, sessions in dataloader:
-            predictions = self.trainer.test_batch(sessions)
-            pred = pred + predictions
-
-        gc.collect()
-        self.MRR, self.NDCG_5, self.NDCG_10, self.HR_1, self.HR_5, self.HR_10 \
-            = self.cal_test_score(pred)
-        return {"MRR": self.MRR, "HR @1": self.HR_1, "HR @5": self.HR_5,
-                "HR @10":  self.HR_10, "NDCG @5":  self.NDCG_5,
-                "NDCG @10": self.NDCG_10}
+    @torch.no_grad()
+    def evaluation(self, mode="valid", global_params=None, round_index=0):
+        if mode not in ('valid', 'test'):
+            raise ValueError('Evaluation mode must be valid or test')
+        model = self.model
+        modules = self._get_shared_modules()
+        saved_shared = [{k:v.detach().cpu().clone() for k,v in module.state_dict().items()} for module in modules]
+        modes = [(module, module.training) for module in model.modules()]
+        cache_names = ('item_index_s','item_index_e','item_graph_embs_s','item_graph_embs_e')
+        caches = {name:(hasattr(model,name),getattr(model,name,None)) for name in cache_names}
+        ranks, losses = [], []
+        try:
+            with preserve_random_state(stream_seed(self.args.eval_seed, self.domain,
+                    'utility_evaluation', round_index)):
+                if global_params is not None:
+                    for module,state in zip(modules,global_params):
+                        module.load_state_dict(state)
+                model.eval()
+                if hasattr(model,'graph_convolution'):
+                    model.graph_convolution(self.adj)
+                loader = self.valid_dataloader if mode == 'valid' else self.test_dataloader
+                for _,sessions in loader:
+                    batch_ranks,batch_losses = self.trainer.test_batch(sessions, return_losses=True)
+                    ranks.extend(batch_ranks)
+                    losses.extend(batch_losses)
+            if not ranks or any(not math.isfinite(value) for value in losses):
+                raise RuntimeError('Empty or nonfinite evaluation')
+            result = {'MRR':sum(1/r for r in ranks)/len(ranks),
+                'HR@10':sum(r<=10 for r in ranks)/len(ranks),
+                'NDCG@10':sum(1/math.log2(r+1) if r<=10 else 0. for r in ranks)/len(ranks),
+                'NEG_CE':-sum(losses)/len(losses)}
+            self._latest_eval_log = result
+            return result
+        finally:
+            for module,state in zip(modules,saved_shared):
+                module.load_state_dict(state)
+            for module,mode_value in modes:
+                module.training = mode_value
+            for name,(present,value) in caches.items():
+                if present:
+                    setattr(model,name,value)
+                elif hasattr(model,name):
+                    delattr(model,name)
 
     def get_old_eval_log(self):
         return {"MRR": self.MRR, "HR @1": self.HR_1, "HR @5": self.HR_5,
@@ -311,7 +380,7 @@ class Client:
             self._method_ckpt_path, "client%d.pt" % self.c_id)
         params = self.trainer.model.state_dict()
         try:
-            torch.save(params, ckpt_filename)
+            atomic_write(ckpt_filename, params, tensor=True)
             print("Model saved to {}".format(ckpt_filename))
         except IOError:
             print("[ Warning: Saving failed... continuing anyway. ]")
@@ -320,7 +389,7 @@ class Client:
         ckpt_filename = os.path.join(
             self._method_ckpt_path, "client%d.pt" % self.c_id)
         try:
-            checkpoint = torch.load(ckpt_filename)
+            checkpoint = torch.load(ckpt_filename, map_location=self.trainer.device, weights_only=True)
         except IOError:
             print("[ Fail: Cannot load model from {}. ]".format(ckpt_filename))
             exit(1)
@@ -337,7 +406,7 @@ class Client:
         ckpt_filename = os.path.join(round_dir, "client%d.pt" % self.c_id)
         params = self.trainer.model.state_dict()
         try:
-            torch.save(params, ckpt_filename)
+            atomic_write(ckpt_filename, params, tensor=True)
             logging.info("Saved round %d checkpoint for client %d to %s",
                          round_idx, self.c_id, ckpt_filename)
         except IOError:
@@ -347,7 +416,7 @@ class Client:
     def load_params_from_path(self, ckpt_path):
         try:
             checkpoint = torch.load(ckpt_path,
-                                     map_location=self.trainer.device)
+                                     map_location=self.trainer.device, weights_only=True)
         except IOError:
             logging.warning("[ Warning: Cannot load model from %s. Skipping. ]",
                             ckpt_path)
